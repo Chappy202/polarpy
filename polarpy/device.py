@@ -5,7 +5,8 @@ from .settings import StreamSettings
 from .commands import Commands
 
 from collections import deque
-from pygatttool import PyGatttool
+import asyncio
+import bleak
 
 
 class CallbacksImpl(Callbacks):
@@ -16,7 +17,6 @@ class CallbacksImpl(Callbacks):
         self.acc_queue = deque()
 
     def _update_one(self) -> bool:
-
         if not self.ppg_queue or not self.acc_queue:
             return False
 
@@ -37,8 +37,7 @@ class CallbacksImpl(Callbacks):
         self.ppg_queue.popleft()
 
         if self._callback:
-            result = {'ppg0': ppg0, 'ppg1': ppg1,
-                      'ppg2': ppg2, 'ax': ax, 'ay': ay, 'az': az}
+            result = {'ppg0': ppg0, 'ppg1': ppg1, 'ppg2': ppg2, 'ax': ax, 'ay': ay, 'az': az}
             self._callback(DeviceType.OH1.name, ts, result)
 
         return True
@@ -86,10 +85,7 @@ class Device:
         self.stream_settings = StreamSettings()
         self._callbacks = CallbacksImpl(callback=callback)
 
-        self._ble = PyGatttool(address=self._addr)
-
-        self._parser = Parser(
-            stream_settings=self.stream_settings, callbacks=self._callbacks)
+        self._parser = Parser(stream_settings=self.stream_settings, callbacks=self._callbacks)
 
         if DeviceType.H10 == type:
             self.stream_settings.ACC_sample_rate = SampleRateSetting.SampleRate200
@@ -99,44 +95,49 @@ class Device:
             self.stream_settings.ACC_sample_rate = SampleRateSetting.SampleRate50
             self.stream_settings.PPG_sample_rate = SampleRateSetting.SampleRate135
 
-    def connect(self) -> bool:
-        if not self._ble.connect():
-            return False
+    async def connect(self) -> bool:
+        self._ble = bleak.BleakClient(self._addr)
+        await self._ble.connect()
 
-        self._ble.char_write_req(handle=self._control_ccc_handle, value=0x200)
-        self._ble.char_write_req(handle=self._data_ccc_handle, value=0x100)
-        self._ble.mtu(232)
-        value = self._ble.char_read_hnd(self._control_handle)
-        self._parser.parse(value)
+        await self._ble.write_gatt_char(self._control_ccc_handle, bytearray([0x02, 0x00]))
+        await self._ble.write_gatt_char(self._data_ccc_handle, bytearray([0x01, 0x00]))
+        await self._ble.write_gatt_descriptor(self._control_handle, bytearray([0x02, 0x00]))
+        await self._ble.write_gatt_descriptor(self._data_handle, bytearray([0x01, 0x00]))
+        await self._ble.write_gatt_char(self._control_handle, bytearray([0x01]))
+        await self._ble.set_disconnected_callback(self._parser.parse)
 
         return True
 
-    def send_command(self, command: bytearray):
-        result = self._ble.char_write_cmd(self._control_handle, command)
+    async def send_command(self, command: bytearray):
+        result = await self._ble.write_gatt_char(self._control_handle, command)
         return self._parser.parse(result)
 
-    def start(self) -> bool:
-        if not self.connect():
+    async def start(self) -> bool:
+        if not await self.connect():
             return False
 
-        self.send_command(Commands.GetACCSettings)
-        self.send_command(Commands.GetPPGSettings)
+        await self.send_command(Commands.GetACCSettings)
+        await self.send_command(Commands.GetPPGSettings)
 
-        self.send_command(Commands.OH1StartPPG)
-        self.send_command(Commands.OH1StartACC)
+        await self.send_command(Commands.OH1StartPPG)
+        await self.send_command(Commands.OH1StartACC)
 
         return True
 
-    def run(self):
-        data = self._ble.wait_for_notification(handle=self._data_handle)
-        return self._parser.parse(data)
+    async def run(self):
+        async with self._ble:
+            while True:
+                data = await self._ble.read_gatt_char(self._data_handle)
+                self._parser.parse(data)
 
 
 class OH1(Device):
     def __init__(self, address: str, control_handle: int,
                  data_handle: int, callback=None):
-
         super().__init__(DeviceType.OH1, address=address,
                          control_handle=control_handle,
                          data_handle=data_handle,
                          callback=callback)
+
+    async def run(self):
+        await super().run()
